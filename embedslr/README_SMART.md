@@ -1,91 +1,94 @@
 
-# SMART-based MCDM module for EmbedSLR
+# SMART (bibliometry) re-ranking module
 
-This module adds a SMART (Simple Multi‑Attribute Rating Technique) ranking layer
-on top of the existing **EmbedSLR** pipeline. It combines four criteria into a single
-score and returns a ranked list of publications.
+**Cel:** Re-ranking publikacji z użyciem metody **SMART** na czterech kryteriach:
+1) podobieństwo semantyczne (z gotowej kolumny `*similarity*` albo odwrócona `*distance*`),
+2) podobieństwo tematyczne po słowach kluczowych autorów (gotowa kolumna, np. `kw_similarity`),
+3) zbieżność połączeń intelektualnych – np. **bibliographic coupling** / wspólne referencje (gotowa kolumna),
+4) wzajemne cytowania (gotowa kolumna).
 
-**Criteria**
-1. Semantic similarity (cosine similarity to the query)
-2. Topical similarity by Authors' Keywords
-3. Overlap of intellectual linkages (shared references)
-4. Mutual citations (bidirectional links within the core set)
+> Moduł **nie przelicza** mierników bibliometrycznych od zera. Wykorzystuje tylko to, co jest już w danych i **jedynie normalizuje** do [0,1], a potem agreguje metodą SMART.
 
-The aggregation follows the additive SMART model. Default weights are derived
-from **SMART importance ranks** via the exponential mapping
-\( w_j \propto (\sqrt{2})^{h_j} \) normalized to sum to 1. You can also pass
-explicit weights that sum to 1.
+### Instalacja / włączenie w Colab
+```python
+# w Colab: wgraj plik smart_mcdm_biblio.py do /content/
+import sys
+sys.path.append('/content')
+from smart_mcdm_biblio import SMARTConfig, rank_with_smart_biblio, quick_diagnose
+```
 
-## Files
-
-- `smart_mcdm.py` – the module (drop into your project or `embedslr/` package)
-- `demo_smart.py` – minimal usage example
-
-## Minimal usage
-
+### Minimalny przykład
 ```python
 import pandas as pd
-from smart_mcdm import rank_with_smart, SMARTConfig
+from smart_mcdm_biblio import SMARTConfig, rank_with_smart_biblio
 
-df = pd.read_csv("ranked.csv")  # produced by embedslr CLI, contains "distance_cosine"
+df = pd.read_csv("ranked.csv")  # Twoje dane z istniejącymi kolumnami
+
 cfg = SMARTConfig(
+    column_map={
+        # ustaw tylko jeśli nazwy w Twoim pliku są specyficzne
+        # 'semantic': 'cosine_distance',       # zostanie zinterpretowane jako dystans -> invert
+        # 'keywords': 'kw_similarity',
+        # 'references': 'bibliographic_coupling',
+        # 'mutual': 'mutual_citations'
+    },
+    # wariant A: wagi bezpośrednio (zostaną znormalizowane)
+    # explicit_weights={'semantic': 0.4, 'keywords': 0.25, 'references': 0.2, 'mutual': 0.15},
+
+    # wariant B: rangi 4–10 (domyślnie jak poniżej); wagi liczone jako (sqrt(2))**h i normalizowane
     importance_ranks={'semantic': 8, 'keywords': 7, 'references': 7, 'mutual': 6},
-    scale_4to10=False,   # if True, utilities are mapped to 4..10 SMART scale before aggregation
-    top_k_seed=20
+
+    scale_4to10=False,          # jeżeli chcesz agregować na skali 4–10 (g_ij), ustaw True
+    available_only=True,        # brakujące kryteria są pomijane, a wagi przeskalowane
+    normalize_strategy="minmax" # 'minmax' albo 'max'
 )
-res = rank_with_smart(df, config=cfg)
 
-ranked = res.df
-ranked.to_csv("ranked_smart.csv", index=False)
+res = rank_with_smart_biblio(df, cfg, top_n=50)
+res.df.to_csv("ranked_smart.csv", index=False)
 
-print("Weights:", res.weights)
-print(ranked[["SMART_score"]].head())
+print("Wagi:", res.weights)
+print("Użyte kolumny:", res.used_columns)
+print(res.utilities.head())
 ```
 
-## CLI integration sketch
-
-If you want to extend the EmbedSLR CLI with a `--smart` flag:
-
+### Interaktywna zmiana wag (Colab)
 ```python
-# inside embedslr/cli.py after ranking by cosine
-from smart_mcdm import rank_with_smart, SMARTConfig
+!pip -q install ipywidgets
+from ipywidgets import interact, IntSlider
+from smart_mcdm_biblio import SMARTConfig, rank_with_smart_biblio
 
-if args.smart:
-    cfg = SMARTConfig(
-        importance_ranks={'semantic': args.w_sem, 'keywords': args.w_kw,
-                          'references': args.w_ref, 'mutual': args.w_mut},
-        scale_4to10=args.smart_scale_4_10,
-        top_k_seed=args.smart_top_k
-    )
-    smart_res = rank_with_smart(ranked, config=cfg)
-    ranked = smart_res.df
+def rerank(sem=8, kw=7, ref=7, mut=6):
+    cfg = SMARTConfig(importance_ranks={'semantic': sem, 'keywords': kw, 'references': ref, 'mutual': mut})
+    res = rank_with_smart_biblio(df, cfg, top_n=20)
+    display(res.df[['SMART_score'] + [c for c in df.columns if c.lower() in ('title','doc_title','article_title','doi')]].head(20))
+    print("Wagi:", res.weights, "| Kolumny:", res.used_columns)
+
+interact(
+    rerank,
+    sem=IntSlider(min=4, max=10, step=1, value=8, description='semantic'),
+    kw=IntSlider(min=4, max=10, step=1, value=7, description='keywords'),
+    ref=IntSlider(min=4, max=10, step=1, value=7, description='references'),
+    mut=IntSlider(min=4, max=10, step=1, value=6, description='mutual')
+);
 ```
 
-Corresponding parser options:
+### Mapowanie nazw kolumn
+Moduł potrafi sam wykryć typowe nazwy. Jeśli Twoje kolumny mają inne nazwy – podaj je jawnie w `SMARTConfig.column_map`:
+- **semantic**: `semantic_similarity`, `cosine_similarity`, `similarity`, `cos_sim`, `distance_cosine`, `cosine_distance`, `semantic_dist`…  
+  (jeśli nazwa zawiera `distance`, moduł automatycznie odwróci skalę).
+- **keywords**: `kw_similarity`, `author_keywords_similarity`, `kw_jaccard`, `keyword_overlap_score`…
+- **references**: `bibliographic_coupling`, `biblio_coupling`, `bc_score`, `common_references`, `co_citation_score`…
+- **mutual**: `mutual_citations`, `reciprocal_citations`, `two_way_citations`, `mutual_citations_count`…
+
+### Diagnoza problemów
 ```python
-ap.add_argument("--smart", action="store_true", help="apply SMART MCDM re‑ranking")
-ap.add_argument("--smart-top-k", type=int, default=20, help="core size used for criteria 2..4")
-ap.add_argument("--smart-scale-4-10", action="store_true", help="map utilities to 4..10 before aggregation")
-ap.add_argument("--w-sem", type=int, default=7, help="SMART rank (4..10) – semantic")
-ap.add_argument("--w-kw",  type=int, default=7, help="SMART rank (4..10) – keywords")
-ap.add_argument("--w-ref", type=int, default=7, help="SMART rank (4..10) – shared refs")
-ap.add_argument("--w-mut", type=int, default=7, help="SMART rank (4..10) – mutual citations")
+from smart_mcdm_biblio import quick_diagnose
+quick_diagnose(df)  # pokaże, które kryteria zostały rozpoznane i podstawowe statystyki kolumn
 ```
 
-## Columns expected
+### Jak działają wagi – SMART
+- Wagi z rang: \( w_j \propto (\sqrt{2})^{h_j} \), następnie normalizacja do sumy 1 (wzory (7)–(8)).
+- Agregacja: \( f_i = \sum_j w_j \, u_{ij} \) (wzór (9)).
+- Opcjonalnie można użyć skali 4–10: \( g_{ij} = 4 + 6\,u_{ij} \) i sumować \( \sum_j w_j g_{ij} \).
 
-- **distance_cosine** – produced by `embedslr.similarity.rank_by_cosine`
-- **Author Keywords** – any of: `Author Keywords`, `Authors Keywords`, `DE`, `Index Keywords`
-- **References** – any of: `References`, `Cited References`, `CR`, `REF`
-- **DOI** – or a title column is needed to detect in‑dataset citation links
-
-The module uses heuristics to parse keywords and references and falls back
-gracefully if a column is missing (the corresponding utility becomes 0).
-
-## Notes
-
-- If you pass `query_vector` + `doc_vectors` instead of `distance_cosine`, the module
-  will compute cosine similarity internally.
-- By default, the "core set" used for criteria (2)–(4) is the top‑K articles by semantic similarity.
-  You can override this with `seed_core_idxs=[...]` or pass a fixed `seed_keywords` set.
-- The result object exposes per‑criterion utilities and contributions so you can audit the score.
+Źródło metody i kroków procesu SMART – patrz **rysunek 2** (str. 6) oraz wzory (7)–(9) w załączonym artykule.
