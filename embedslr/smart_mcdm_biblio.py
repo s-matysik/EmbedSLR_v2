@@ -3,23 +3,16 @@
 SMART (Simple Multi-Attribute Rating Technique) re-ranking module
 for bibliometric selection of scientific publications.
 
-This version uses EXISTING metrics/columns only. It DOES NOT recompute
-bibliometric measures (e.g., coupling, mutual citations) from raw data;
-it only *rescales* the provided columns and aggregates them via SMART.
+Key properties of this version:
+ - Uses ONLY existing metrics/columns (no recomputation of bibliometrics).
+ - Supports flexible column mapping + automatic synonyms.
+ - Lets users set weights either as ranks (4..10) or direct weights.
+ - Adds robust file loading helpers.
+ - Provides a CLI for easy use from terminal/Colab.
 
-Criteria expected (map to your columns via SMARTConfig.column_map):
-    - semantic: semantic similarity (or cosine distance to be inverted)
-    - keywords: similarity based on author keywords (precomputed)
-    - references: intellectual link convergence (e.g., bibliographic coupling, common refs) - precomputed
-    - mutual: mutual citations (precomputed)
-
-Weights can be provided as direct weights (explicit_weights) or as ranks 4–10
-(importance_ranks). If ranks are used, weights are computed per SMART:
-    w_j ∝ (sqrt(2))**h_j  and then normalized to sum=1.
-Optionally, you can aggregate on the 4–10 scale (scale_4to10=True).
-
-Author: ChatGPT (module for EmbedSLR integration)
-License: MIT
+Method notes (per SMART):
+ - Weights from ranks h_j:  w_j ∝ (sqrt(2))**h_j  (then normalized to sum=1).
+ - Aggregation: sum_j w_j * u_ij (utilities in [0,1]), or on 4–10 scale if enabled.
 """
 
 from __future__ import annotations
@@ -29,6 +22,9 @@ import numpy as np
 import pandas as pd
 import math
 import warnings
+import argparse
+import sys
+from pathlib import Path
 
 
 # ---------------------------- Configuration ----------------------------
@@ -97,6 +93,43 @@ class SMARTResult:
     weights: Dict[str, float]                     # normalized weights actually used
     used_columns: Dict[str, str]                  # mapping criterion -> df column actually used
     dropped_criteria: List[str]                   # criteria requested but not used
+
+
+# ---------------------------- File I/O helpers ----------------------------
+
+READ_CANDIDATE_EXTS = {'.csv', '.tsv', '.txt', '.xlsx', '.xls', '.parquet', '.pq', '.feather', '.ft'}
+
+def read_candidates(path: str) -> pd.DataFrame:
+    """Read a table of candidates from CSV/TSV/Excel/Parquet/Feather with best-effort encoding fallbacks."""
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(f"Input file not found: {path}")
+    ext = p.suffix.lower()
+    if ext not in READ_CANDIDATE_EXTS:
+        raise ValueError(f"Unsupported input extension {ext}. Supported: {sorted(READ_CANDIDATE_EXTS)}")
+    if ext in {'.csv', '.txt'}:
+        for enc in ('utf-8', 'utf-8-sig', 'ISO-8859-1'):
+            try:
+                return pd.read_csv(p, encoding=enc, on_bad_lines='skip', low_memory=False)
+            except UnicodeDecodeError:
+                continue
+        # last attempt without encoding
+        return pd.read_csv(p, on_bad_lines='skip', low_memory=False)
+    if ext == '.tsv':
+        for enc in ('utf-8', 'utf-8-sig', 'ISO-8859-1'):
+            try:
+                return pd.read_csv(p, sep='\t', encoding=enc, on_bad_lines='skip', low_memory=False)
+            except UnicodeDecodeError:
+                continue
+        return pd.read_csv(p, sep='\t', on_bad_lines='skip', low_memory=False)
+    if ext in {'.xlsx', '.xls'}:
+        return pd.read_excel(p)
+    if ext in {'.parquet', '.pq'}:
+        return pd.read_parquet(p)
+    if ext in {'.feather', '.ft'}:
+        return pd.read_feather(p)
+    # fallback
+    return pd.read_csv(p, encoding='utf-8', on_bad_lines='skip', low_memory=False)
 
 
 # ---------------------------- Core utilities ----------------------------
@@ -203,19 +236,6 @@ def rank_with_smart_biblio(df: pd.DataFrame,
     """
     Re-rank publications using SMART with given bibliometric/semantic criteria.
     This function does NOT compute metrics; it only uses the columns already present.
-
-    Parameters
-    ----------
-    df : pd.DataFrame
-        Input with candidate publications. The function will not modify df in-place.
-    config : SMARTConfig
-        Configuration with column mapping and weights/ranks.
-    top_n : Optional[int]
-        If set, the returned df will be truncated to top_n rows (after sorting).
-
-    Returns
-    -------
-    SMARTResult
     """
     if config is None:
         config = SMARTConfig()
@@ -307,21 +327,102 @@ def quick_diagnose(df: pd.DataFrame, config: Optional['SMARTConfig'] = None) -> 
     return diag
 
 
-# ---------------------------- Colab helpers ----------------------------
+# ---------------------------- CLI ----------------------------
 
-def colab_install_snippet() -> str:
-    """Returns a string with a ready-to-paste Colab setup cell to avoid common errors."""
-    return """# ==== Colab one-time setup ====
-!pip -q install -U pandas pyarrow ipywidgets
-from google.colab import output
-output.enable_custom_widget_manager()
+def build_arg_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description="SMART (bibliometry) re-ranking CLI")
+    p.add_argument('--input', '-i', required=True, help="Ścieżka do pliku z kandydatami (CSV/TSV/Excel/Parquet/Feather)")
+    p.add_argument('--output', '-o', default=None, help="Ścieżka do wyjściowego CSV (domyślnie <input>_smart.csv)")
+    p.add_argument('--top', type=int, default=None, help="Zwróć tylko TOP-N wierszy")
 
-import sys, os, zipfile, glob
-# If your module file is on Drive or uploaded:
-# 1) Upload smart_mcdm_biblio.py to /content/
-# 2) Or unzip your project and add to sys.path
-if '/content' not in sys.path:
-    sys.path.append('/content')
+    # Column mapping
+    p.add_argument('--col-semantic', help="Nazwa kolumny dla kryterium 'semantic'")
+    p.add_argument('--col-keywords', help="Nazwa kolumny dla kryterium 'keywords'")
+    p.add_argument('--col-references', help="Nazwa kolumny dla kryterium 'references'")
+    p.add_argument('--col-mutual', help="Nazwa kolumny dla kryterium 'mutual'")
+    p.add_argument('--semantic-is-distance', action='store_true', help="Wymuś interpretację kolumny semantycznej jako dystans (odwracanie skali)")
 
-print("Python OK. pandas:", __import__('pandas').__version__)
-"""
+    # Weights
+    p.add_argument('--w-semantic', type=float, help="Waga bezpośrednia dla 'semantic'")
+    p.add_argument('--w-keywords', type=float, help="Waga bezpośrednia dla 'keywords'")
+    p.add_argument('--w-references', type=float, help="Waga bezpośrednia dla 'references'")
+    p.add_argument('--w-mutual', type=float, help="Waga bezpośrednia dla 'mutual'")
+    p.add_argument('--rank-semantic', type=int, default=8, help="Ranga (4–10) dla 'semantic' (używana jeśli nie podano wag)")
+    p.add_argument('--rank-keywords', type=int, default=7, help="Ranga (4–10) dla 'keywords'")
+    p.add_argument('--rank-references', type=int, default=7, help="Ranga (4–10) dla 'references'")
+    p.add_argument('--rank-mutual', type=int, default=6, help="Ranga (4–10) dla 'mutual'")
+
+    # Other
+    p.add_argument('--scale-4-10', action='store_true', help="Agreguj na skali 4–10 (g_ij = 4+6*u_ij)")
+    p.add_argument('--norm', choices=['minmax', 'max'], default='minmax', help="Strategia normalizacji pojedynczych kryteriów")
+    p.add_argument('--available-only', action='store_true', help="Pomiń brakujące kryteria i przeskaluj wagi")
+    p.add_argument('--verbose', action='store_true', help="Więcej logów")
+    return p
+
+
+def cli_main(argv=None) -> int:
+    parser = build_arg_parser()
+    args = parser.parse_args(argv)
+
+    # Build config
+    column_map = {}
+    if args.col_semantic: column_map['semantic'] = args.col_semantic
+    if args.col_keywords: column_map['keywords'] = args.col_keywords
+    if args.col_references: column_map['references'] = args.col_references
+    if args.col_mutual: column_map['mutual'] = args.col_mutual
+
+    explicit_weights = None
+    # If any direct weights provided, use them; they will be normalized
+    if any(v is not None for v in [args.w_semantic, args.w_keywords, args.w_references, args.w_mutual]):
+        explicit_weights = {
+            'semantic': args.w_semantic or 0.0,
+            'keywords': args.w_keywords or 0.0,
+            'references': args.w_references or 0.0,
+            'mutual': args.w_mutual or 0.0
+        }
+
+    cfg = SMARTConfig(
+        column_map=column_map,
+        explicit_weights=explicit_weights,
+        importance_ranks={
+            'semantic': args.rank_semantic,
+            'keywords': args.rank_keywords,
+            'references': args.rank_references,
+            'mutual': args.rank_mutual
+        },
+        scale_4to10=args.scale_4_10,
+        available_only=args.available_only,
+        normalize_strategy=args.norm,
+        semantic_is_distance=True if args.semantic_is_distance else None,
+        verbose=args.verbose
+    )
+
+    # Load data
+    df = read_candidates(args.input)
+    if args.verbose:
+        print("[SMART] columns detected:", list(df.columns)[:60])
+
+    # Diagnose
+    if args.verbose:
+        quick_diagnose(df, cfg)
+
+    # Rank
+    res = rank_with_smart_biblio(df, cfg, top_n=args.top)
+
+    # Save
+    out_path = args.output
+    if out_path is None:
+        p = Path(args.input)
+        out_path = str(p.with_suffix('')) + "_smart.csv"
+    res.df.to_csv(out_path, index=False, encoding='utf-8')
+    if args.verbose:
+        print("[SMART] saved:", out_path)
+        print("[SMART] weights:", res.weights)
+        print("[SMART] used_columns:", res.used_columns)
+        if res.dropped_criteria:
+            print("[SMART] dropped:", res.dropped_criteria)
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(cli_main())
