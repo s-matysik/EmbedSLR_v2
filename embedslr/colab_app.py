@@ -282,7 +282,7 @@ with gr.Blocks(title="EmbedSLR – Multi‑Embedding Wizard") as demo:
 
     run_btn = gr.Button("▶️ Uruchom wszystkie kombinacje")
     with gr.Row():
-        summary_out = gr.Dataframe(label="Podsumowanie kombinacji", interactive=False, wrap=True)
+        summary_out = gr.Dataframe(label="Podsumowanie kombinacji", interactive=False)  # <- FIX: bez wrap
     with gr.Row():
         zip_out = gr.File(label="Pobierz ZIP z wynikami")
     info_out = gr.Markdown()
@@ -300,6 +300,14 @@ with gr.Blocks(title="EmbedSLR – Multi‑Embedding Wizard") as demo:
         outputs=[summary_out, zip_out, info_out]
     )
 
+def run(share: bool = True, server_name: str = "0.0.0.0", server_port: int | None = None):
+    """
+    Uruchamia Wizard w trybie zgodnym z Colab:
+        from embedslr.colab_app import run
+        run()
+    """
+    return demo.launch(share=share, server_name=server_name, server_port=server_port)
+
 if __name__ == "__main__":
     # W Colab możesz dać share=True
-    demo.launch()
+    run()
