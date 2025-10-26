@@ -1,383 +1,305 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+colab_app.py — Wizard do EmbedSLR z obsługą wielu modeli (2/3/4/5)
+Autor: seba
+"""
 
-# embedslr/colab_app.py
 from __future__ import annotations
 
-"""
-Colab mini-GUI for EmbedSLR: Embeddings + SMART (MCDM)
-
-Usage in Colab after installing the repo:
-    !pip -q install -U "git+https://github.com/s-matysik/EmbedSLR_v2.git"
-    from embedslr.colab_app import run
-    run()
-
-What it does:
- 1) Lets you load a dataset (CSV/TSV/XLSX/Parquet/Feather).
- 2) (Optional) Computes semantic embeddings for the query and documents
-    using `embedslr.embeddings.get_embeddings` and produces a
-    `distance_cosine` column (lower=better).
- 3) Runs SMART aggregation on existing metrics + the semantic distance
-    (or similarity) as one of the criteria.
- 4) Saves and offers to download SMART_result.csv.
-
-Notes:
- - Bibliometric metrics are NOT recomputed here. The app only uses the columns
-   already present in the dataset (keywords similarity, coupling, mutual citations, ...).
- - Embeddings depend on the chosen provider/model. For `sbert` you may need:
-     pip install -U sentence-transformers
- - OpenAI/Cohere/Nomic/Jina providers require API keys in environment variables,
-   as expected by embedslr.embeddings.
-"""
-
-from typing import Dict, List, Optional
-from pathlib import Path
+import os
+import io
+import json
+import time
+import itertools as it
+import textwrap
+import zipfile
+from typing import List, Tuple, Dict
 
 import pandas as pd
-from IPython.display import display, clear_output
-import ipywidgets as W
+import gradio as gr
 
-from .io import autodetect_columns, combine_title_abstract
-from .similarity import rank_by_cosine
-from .smart_mcdm_biblio import SMARTConfig, rank_with_smart_biblio, read_candidates
-from .embeddings import get_embeddings, list_models
-
-
-def _none_if_blank(x: Optional[str]) -> Optional[str]:
-    if x is None or str(x).strip() == "" or x == "— brak —":
-        return None
-    return str(x)
+# ─ EmbedSLR: wewnętrzne moduły (z wcześniejszych modyfikacji) ─
+from embedslr.io import autodetect_columns, combine_title_abstract
+from embedslr.ensemble import ModelSpec, run_ensemble, per_group_bibliometrics
+from embedslr.bibliometrics import full_report
 
 
-def run() -> None:
-    # Enable widget manager in Colab (no-op elsewhere)
-    try:
-        from google.colab import output  # type: ignore
-        output.enable_custom_widget_manager()
-    except Exception:
-        pass
+# ───────────────────────────────────────────────────────────────────────────────
+# Katalog modeli (przykładowe, można rozszerzać)
+# Format: widoczna etykieta -> "provider:model_id"
+# (provider jest rozumiany przez embedslr.embeddings.get_embeddings)
+# ───────────────────────────────────────────────────────────────────────────────
 
-    # ─────────────── UI widgets ───────────────
-    hdr = W.HTML("<h3>EmbedSLR Colab App — Embeddings + SMART</h3>")
-    uploader = W.FileUpload(accept=".csv,.tsv,.txt,.xlsx,.xls,.parquet,.feather", multiple=False)
-    btn_load  = W.Button(description="Wczytaj plik", button_style="primary", icon="upload")
-    lbl_file  = W.HTML("<i>Wybierz plik i kliknij 'Wczytaj plik'.</i>")
-    out = W.Output()
+MODEL_CATALOG: Dict[str, str] = {
+    "SBERT • sentence-transformers/all-MiniLM-L12-v2":
+        "sbert:sentence-transformers/all-MiniLM-L12-v2",
+    "SBERT • sentence-transformers/all-mpnet-base-v2":
+        "sbert:sentence-transformers/all-mpnet-base-v2",
+    "SBERT • sentence-transformers/all-distilroberta-v1":
+        "sbert:sentence-transformers/all-distilroberta-v1",
+    "OpenAI • text-embedding-3-large":
+        "openai:text-embedding-3-large",
+    # W artykule badano też ten model – jeśli nieaktywny w Twoim środowisku, po prostu go nie wybieraj.
+    "OpenAI (legacy) • text-embedding-ada-002":
+        "openai:text-embedding-ada-002",
+    "Nomic • nomic-embed-text-v1.5":
+        "nomic:nomic-embed-text-v1.5",
+    "Jina • jina-embeddings-v3":
+        "jina:jina-embeddings-v3",
+    "Cohere • embed-english-v3.0":
+        "cohere:embed-english-v3.0",
+}
 
-    # 1) Embedding section
-    box_emb_hdr = W.HTML("<b>1) Ustawienia embeddingów (opcjonalne)</b>")
-    txt_query = W.Textarea(placeholder="Wpisz zapytanie (query) do embeddingu...", description="Query:")
-    btn_guess_cols = W.Button(description="Auto‑wybór kolumn Tytuł/Abstrakt", icon="magic")
-    ddl_title = W.Dropdown(options=[], description="Tytuł:", disabled=True)
-    ddl_abs   = W.Dropdown(options=[], description="Abstrakt:", disabled=True)
-    ch_combine = W.Checkbox(value=True, description="Tytuł + Abstrakt (zalecane)")
+RECOMMENDED_DEFAULTS = [
+    "SBERT • sentence-transformers/all-MiniLM-L12-v2",
+    "SBERT • sentence-transformers/all-mpnet-base-v2",
+    "OpenAI (legacy) • text-embedding-ada-002",
+    "Nomic • nomic-embed-text-v1.5",
+]
 
-    # Provider/model
-    providers = ["sbert", "openai", "cohere", "nomic", "jina"]
-    ddl_provider = W.Dropdown(options=providers, value="sbert", description="Provider:")
-    # models list (will be filled dynamically)
-    ddl_model = W.Dropdown(options=[], description="Model:")
-    btn_refresh_models = W.Button(description="Odśwież modele", icon="refresh")
-    ch_compute_emb = W.Checkbox(value=True, description="Wylicz embeddings i kolumnę distance_cosine")
-    lim_docs = W.BoundedIntText(min=0, max=10_000_000, value=0, description="Limit dokumentów (0=wszystkie):")
 
-    # 2) SMART section
-    box_smart_hdr = W.HTML("<b>2) Wybór wielokryterialny (SMART)</b>")
-    ddl_sem = W.Dropdown(options=[], description="Semantyka:", disabled=True)
-    ddl_kw  = W.Dropdown(options=[], description="Sł. kluczowe:", disabled=True)
-    ddl_ref = W.Dropdown(options=[], description="Referencje:", disabled=True)
-    ddl_mut = W.Dropdown(options=[], description="Wzajemne cyt.:", disabled=True)
-    ch_sem_is_dist = W.Checkbox(value=True, description="Semantyka to 'distance' (odwróć)", disabled=True)
+# ───────────────────────────────────────────────────────────────────────────────
+# Pomocnicze
+# ───────────────────────────────────────────────────────────────────────────────
 
-    ddl_norm = W.Dropdown(options=[("minmax","minmax"),("max","max")], value="minmax", description="Normalizacja:")
-    chk_scale = W.Checkbox(value=False, description="Agregacja na skali 4–10")
-    chk_avail = W.Checkbox(value=True, description="Pomiń brakujące kryteria")
-    weight_mode = W.ToggleButtons(options=[("Rangi 4–10","ranks"),("Wagi bezp.","weights")], value="ranks", description="Tryb wag:")
+def _to_models(selected_labels: List[str]) -> List[ModelSpec]:
+    """Konwersja wyboru UI (etykiet) na listę ModelSpec."""
+    specs: List[ModelSpec] = []
+    for label in selected_labels:
+        raw = MODEL_CATALOG[label]
+        if ":" not in raw:
+            raise ValueError(f"Nieprawidłowy model: {raw}")
+        prov, mid = raw.split(":", 1)
+        specs.append(ModelSpec(prov, mid))
+    return specs
 
-    sl_sem_r = W.IntSlider(min=4, max=10, value=8, step=1, description="rank(seman.)")
-    sl_kw_r  = W.IntSlider(min=4, max=10, value=7, step=1, description="rank(keyw.)")
-    sl_ref_r = W.IntSlider(min=4, max=10, value=7, step=1, description="rank(ref.)")
-    sl_mut_r = W.IntSlider(min=4, max=10, value=6, step=1, description="rank(mutual)")
 
-    sl_sem_w = W.FloatSlider(min=0, max=1, value=0.40, step=0.01, description="w(seman.)", readout_format=".2f")
-    sl_kw_w  = W.FloatSlider(min=0, max=1, value=0.25, step=0.01, description="w(keyw.)",  readout_format=".2f")
-    sl_ref_w = W.FloatSlider(min=0, max=1, value=0.20, step=0.01, description="w(ref.)",   readout_format=".2f")
-    sl_mut_w = W.FloatSlider(min=0, max=1, value=0.15, step=0.01, description="w(mutual)", readout_format=".2f")
-    lbl_wsum = W.HTML("Suma wag (zostanie znormalizowana): 1.00")
+def _short(ms: ModelSpec) -> str:
+    """Krótka etykieta dla modelu do nazw plików."""
+    return ms.label.replace("/", "_")
 
-    def _update_weight_sum(*_):
-        s = sl_sem_w.value + sl_kw_w.value + sl_ref_w.value + sl_mut_w.value
-        lbl_wsum.value = f"Suma wag (zostanie znormalizowana): <b>{s:.2f}</b>"
 
-    sl_sem_w.observe(_update_weight_sum, "value")
-    sl_kw_w.observe(_update_weight_sum, "value")
-    sl_ref_w.observe(_update_weight_sum, "value")
-    sl_mut_w.observe(_update_weight_sum, "value")
+def _combo_tag(specs: List[ModelSpec]) -> str:
+    """Identyfikator kombinacji do nazw plików."""
+    return "__".join(_short(m) for m in specs)
 
-    def _toggle_weight_mode(*_):
-        ranks_vis = "block" if weight_mode.value == "ranks" else "none"
-        weights_vis = "none" if weight_mode.value == "ranks" else "block"
-        box_ranks.layout.display = ranks_vis
-        box_weights.layout.display = weights_vis
 
-    box_ranks  = W.VBox([sl_sem_r, sl_kw_r, sl_ref_r, sl_mut_r])
-    box_weights= W.VBox([sl_sem_w, sl_kw_w, sl_ref_w, sl_mut_w, lbl_wsum])
-    _toggle_weight_mode()
-    weight_mode.observe(_toggle_weight_mode, "value")
+def _hit_distribution(df: pd.DataFrame) -> str:
+    """Zliczenie rozkładu hit_count do krótkiego stringa."""
+    vc = df["hit_count"].value_counts().sort_index(ascending=False)
+    return "; ".join(f"{int(k)}:{int(v)}" for k, v in vc.items() if k > 0)
 
-    topN = W.BoundedIntText(min=1, max=10_000_000, value=100, description="TOP-N:")
-    btn_run = W.Button(description="Uruchom (Embeddings → SMART)", button_style="success", icon="cogs")
-    btn_prev= W.Button(description="Podgląd danych", icon="eye")
 
-    # State
-    state: Dict[str, object] = {"df": None, "path": None, "title_col": None, "abs_col": None}
+def _ensure_env(openai_key: str | None, cohere_key: str | None, nomic_key: str | None):
+    """Ustawienie kluczy API, jeśli podano."""
+    if openai_key:
+        os.environ["OPENAI_API_KEY"] = openai_key.strip()
+    if cohere_key:
+        os.environ["COHERE_API_KEY"] = cohere_key.strip()
+    if nomic_key:
+        os.environ["NOMIC_API_KEY"] = nomic_key.strip()
 
-    # ---- helpers ----
-    def _write_upload_to_disk(upl: W.FileUpload) -> Optional[str]:
-        if not upl.value:
-            return None
-        meta = next(iter(upl.value.values()))
-        name = meta["metadata"]["name"]
-        content = meta["content"]
-        updir = Path("/content/uploads"); updir.mkdir(parents=True, exist_ok=True)
-        path = updir / name
-        with open(path, "wb") as f:
-            f.write(content)
-        return str(path)
 
-    def _fill_models(*_):
-        try:
-            models_dict = list_models()
-        except Exception as e:
-            # Static fallback for SBERT
-            models_dict = {
-                "sbert": [
-                    "sentence-transformers/all-MiniLM-L6-v2",
-                    "sentence-transformers/distiluse-base-multilingual-cased-v2",
-                ],
-                "openai": ["text-embedding-3-small","text-embedding-3-large"],
-                "cohere": ["embed-english-v3.0","embed-multilingual-v3.0"],
-                "nomic": ["nomic-embed-text-v1"],
-                "jina": ["jina-embeddings-v2-base-en","jina-embeddings-v3"]
-            }
-        prov = ddl_provider.value
-        ddl_model.options = models_dict.get(prov, models_dict.get("sbert", []))
-        if ddl_model.options:
-            ddl_model.value = ddl_model.options[0]
+def _prepare_df(csv_path: str) -> Tuple[pd.DataFrame, str, str]:
+    """
+    Wczytanie CSV (Scopus) i zbudowanie kolumny 'combined_text' zgodnie z EmbedSLR.
+    Zwraca df, title_col, abs_col.
+    """
+    df = pd.read_csv(csv_path)
+    title_col, abs_col = autodetect_columns(df)
+    df["combined_text"] = combine_title_abstract(df, title_col, abs_col)
+    return df, title_col, abs_col
 
-    def _guess_title_abs(df: pd.DataFrame):
-        try:
-            title_col, abs_col = autodetect_columns(df)
-        except Exception:
-            # fallback: any string columns
-            str_cols = [c for c in df.columns if pd.api.types.is_string_dtype(df[c])]
-            title_col = str_cols[0] if str_cols else None
-            abs_col = (str_cols[1] if len(str_cols) > 1 else None)
-        return title_col, abs_col
 
-    # ---- callbacks ----
-    def on_load_clicked(_b):
-        with out:
-            clear_output()
-            try:
-                path = _write_upload_to_disk(uploader)
-                if not path:
-                    print("Nie wybrano pliku.")
-                    return
-                df = read_candidates(path)
-                state["df"] = df
-                state["path"] = path
-                print(f"✓ Wczytano: {Path(path).name}  |  wiersze: {len(df)}, kolumny: {len(df.columns)}")
+# ───────────────────────────────────────────────────────────────────────────────
+# Rdzeń przetwarzania — uruchom wszystkie kombinacje 2/3/4/5
+# ───────────────────────────────────────────────────────────────────────────────
 
-                # Fill column dropdowns
-                opts = ["— brak —"] + list(df.columns)
-                for w in (ddl_sem, ddl_kw, ddl_ref, ddl_mut, ddl_title, ddl_abs):
-                    w.options = opts
-                    w.disabled = False
+def run_wizard(
+    scopus_csv: str,
+    query: str,
+    selected_model_labels: List[str],
+    sizes: List[str],
+    top_k: int,
+    aggregator: str,
+    openai_key: str | None,
+    cohere_key: str | None,
+    nomic_key: str | None,
+    progress=gr.Progress(track_tqdm=True),
+) -> Tuple[pd.DataFrame, str, str]:
+    """
+    Główna funkcja wywoływana z UI.
 
-                # Guess title/abstract
-                tcol, acol = _guess_title_abs(df)
-                state["title_col"], state["abs_col"] = tcol, acol
-                ddl_title.value = tcol or "— brak —"
-                ddl_abs.value = acol or "— brak —"
+    Zwraca:
+      - dataframe podsumowujący,
+      - ścieżkę do ZIP z wszystkimi wynikami,
+      - log (markdown).
+    """
+    t0 = time.time()
+    _ensure_env(openai_key, cohere_key, nomic_key)
 
-                # Guess semantic column
-                sem_guess = None
-                for cand in ["distance_cosine","cosine_distance","semantic_similarity","cosine_similarity","similarity"]:
-                    if cand in df.columns:
-                        sem_guess = cand; break
-                ddl_sem.value = sem_guess or "— brak —"
-                ch_sem_is_dist.disabled = False
-                ch_sem_is_dist.value = (sem_guess or "").lower().find("dist") != -1 or (sem_guess or "").lower().find("distance") != -1
+    # 1) Dane
+    df, title_col, _abs_col = _prepare_df(scopus_csv)
+    if df.empty:
+        raise gr.Error("Plik CSV wydaje się pusty.")
 
-                # Other columns
-                for cands, widget in [
-                    (["kw_similarity","author_keywords_similarity","kw_jaccard","keyword_overlap_score"], ddl_kw),
-                    (["bibliographic_coupling","biblio_coupling","bc_score","common_references","co_citation_score"], ddl_ref),
-                    (["mutual_citations","reciprocal_citations","two_way_citations","mutual_citations_count"], ddl_mut),
-                ]:
-                    for c in cands:
-                        if c in df.columns:
-                            widget.value = c; break
+    # 2) Modele i rozmiary kombinacji
+    if not selected_model_labels or len(selected_model_labels) < 2:
+        raise gr.Error("Wybierz co najmniej 2 modele.")
+    base_models = _to_models(selected_model_labels)
 
-                print("Mapowanie (możesz zmienić):")
-                print("  semantic   ->", ddl_sem.value)
-                print("  keywords   ->", ddl_kw.value)
-                print("  references ->", ddl_ref.value)
-                print("  mutual     ->", ddl_mut.value)
+    sizes_int = sorted({int(s) for s in sizes})
+    sizes_int = [k for k in sizes_int if 2 <= k <= min(5, len(base_models))]
+    if not sizes_int:
+        raise gr.Error("Zaznaczone rozmiary kombinacji są większe niż liczba wybranych modeli.")
 
-                _fill_models()
+    # 3) Wszystkie kombinacje
+    all_combos: List[List[ModelSpec]] = []
+    for k in sizes_int:
+        all_combos.extend(list(it.combinations(base_models, k)))
 
-            except Exception as e:
-                print("Błąd wczytywania:", e)
+    # 4) Wyniki: w pamięci + ZIP na dysku
+    out_rows = []
+    zip_name = f"/tmp/embedslr_ensemble_{int(time.time())}.zip"
 
-    btn_load.on_click(on_load_clicked)
-    btn_refresh_models.on_click(lambda _b: _fill_models())
+    with zipfile.ZipFile(zip_name, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+        # Zapisz metadane wsadu
+        meta = {
+            "query": query,
+            "top_k_per_model": top_k,
+            "aggregator": aggregator,
+            "selected_models": [m.__dict__ for m in base_models],
+            "sizes": sizes_int,
+        }
+        zf.writestr("meta.json", json.dumps(meta, indent=2, ensure_ascii=False))
 
-    def on_guess_cols(_b):
-        df = state["df"]
-        if df is None:
-            with out:
-                clear_output()
-                print("Najpierw wczytaj plik.")
-            return
-        tcol, acol = _guess_title_abs(df)
-        state["title_col"], state["abs_col"] = tcol, acol
-        ddl_title.value = tcol or "— brak —"
-        ddl_abs.value = acol or "— brak —"
-    btn_guess_cols.on_click(on_guess_cols)
+        # Przetwarzaj kolejne kombinacje
+        for combo in progress.tqdm(all_combos, desc="Liczenie kombinacji"):
+            combo: Tuple[ModelSpec, ...]
+            combo_list = list(combo)
+            tag = _combo_tag(combo_list)
+            k = len(combo_list)
 
-    def on_prev_clicked(_b):
-        with out:
-            clear_output()
-            df = state["df"]
-            if df is None:
-                print("Najpierw wczytaj plik.")
-                return
-            display(df.head(10))
-
-    btn_prev.on_click(on_prev_clicked)
-
-    def on_run_clicked(_b):
-        with out:
-            clear_output()
-            df = state["df"]
-            if df is None:
-                print("Najpierw wczytaj plik.")
-                return
-
-            # 1) Embeddings (optional)
-            if ch_compute_emb.value:
-                q = txt_query.value.strip()
-                if not q:
-                    print("Podaj tekst zapytania (query) dla embeddingu.")
-                    return
-                prov = ddl_provider.value
-                model = ddl_model.value
-                # build doc texts
-                title_col = _none_if_blank(ddl_title.value) or state["title_col"]
-                abs_col   = _none_if_blank(ddl_abs.value) or state["abs_col"]
-
-                if not title_col and not abs_col:
-                    print("Nie wskazano kolumn tytułu/abstraktu.")
-                    return
-
-                if ch_combine.value and title_col and abs_col:
-                    texts = combine_title_abstract(df, title_col, abs_col).fillna("").astype(str).tolist()
-                else:
-                    col = title_col or abs_col
-                    texts = df[col].fillna("").astype(str).tolist()
-
-                # limit docs?
-                lim = int(lim_docs.value or 0)
-                if lim and lim < len(texts):
-                    texts = texts[:lim]
-                    df = df.iloc[:lim].copy()
-
-                # compute embeddings
-                try:
-                    q_vec = get_embeddings([q], provider=prov, model=model)[0]
-                    d_vecs = get_embeddings(texts, provider=prov, model=model)
-                except Exception as e:
-                    print("Błąd embeddingu:", e)
-                    print("Wskazówka: dla provider='sbert' zainstaluj 'sentence-transformers', "
-                          "dla OpenAI/Cohere/Nomic/Jina ustaw odpowiednie klucze API w środowisku.")
-                    return
-
-                # add distance_cosine via helper
-                df = rank_by_cosine(q_vec, d_vecs, df)
-                # prefer semantic 'distance_cosine' as default
-                ddl_sem.value = "distance_cosine"
-                ch_sem_is_dist.value = True
-
-                print(f"✓ Obliczono embeddings ({prov}:{model}) i kolumnę 'distance_cosine'.")
-
-            # 2) SMART
-            def _none_if_noopt(x):
-                return None if (x is None or x == "— brak —") else x
-
-            colmap = {
-                "semantic": _none_if_noopt(ddl_sem.value),
-                "keywords": _none_if_noopt(ddl_kw.value),
-                "references": _none_if_noopt(ddl_ref.value),
-                "mutual": _none_if_noopt(ddl_mut.value),
-            }
-
-            explicit = None
-            ranks = None
-            if weight_mode.value == "weights":
-                explicit = {
-                    "semantic": float(sl_sem_w.value),
-                    "keywords": float(sl_kw_w.value),
-                    "references": float(sl_ref_w.value),
-                    "mutual": float(sl_mut_w.value),
-                }
-            else:
-                ranks = {
-                    "semantic": int(sl_sem_r.value),
-                    "keywords": int(sl_kw_r.value),
-                    "references": int(sl_ref_r.value),
-                    "mutual": int(sl_mut_r.value),
-                }
-
-            cfg = SMARTConfig(
-                column_map=colmap,
-                explicit_weights=explicit,
-                importance_ranks=ranks or {'semantic':8,'keywords':7,'references':7,'mutual':6},
-                scale_4to10=bool(chk_scale.value),
-                available_only=bool(chk_avail.value),
-                normalize_strategy=str(ddl_norm.value),
-                semantic_is_distance=bool(ch_sem_is_dist.value),
-                verbose=True
+            # 4a) Ranking konsensusu
+            ranked = run_ensemble(
+                df, "combined_text", query, combo_list,
+                top_k_per_model=top_k, aggregator=aggregator  # mean|min|median
             )
 
-            res = rank_with_smart_biblio(df, cfg, top_n=int(topN.value))
+            # 4b) Raporty i metryki per-grupa
+            groups_df = per_group_bibliometrics(ranked)
+            report_txt = full_report(ranked, path=None, top_n=top_k)
 
-            print("Wagi (po normalizacji):", res.weights)
-            print("Użyte kolumny:", res.used_columns)
-            if res.dropped_criteria:
-                print("Pominięto kryteria:", res.dropped_criteria)
+            # 4c) Podsumowanie do tabeli zbiorczej
+            top_titles = ", ".join(
+                [str(t) for t in ranked[title_col].head(3).tolist()]
+            )
+            dist = _hit_distribution(ranked)
+            out_rows.append({
+                "k": k,
+                "kombinacja": " + ".join(m.label for m in combo_list),
+                "id_kombinacji": tag,
+                "liczba_rekordow": len(ranked),
+                "top3_tytuly": top_titles,
+                "rozkład_hit_count": dist,
+            })
 
-            display(res.df.head(20))
+            # 4d) Zapis plików tej kombinacji
+            # ranking
+            csv_buf = io.StringIO()
+            ranked.to_csv(csv_buf, index=False)
+            zf.writestr(f"ranking__k{k}__{tag}.csv", csv_buf.getvalue())
 
-            out_path = "/content/SMART_result.csv"
-            res.df.to_csv(out_path, index=False, encoding="utf-8")
-            print(f"✓ Zapisano: {out_path}")
-            try:
-                from google.colab import files as _files  # type: ignore
-                _files.download(out_path)
-            except Exception:
-                print("Pobierz ręcznie plik /content/SMART_result.csv")
+            # per-group bibliometrics
+            csv_buf = io.StringIO()
+            groups_df.to_csv(csv_buf, index=False)
+            zf.writestr(f"groups__k{k}__{tag}.csv", csv_buf.getvalue())
 
-    btn_run.on_click(on_run_clicked)
+            # full bibliometric report
+            zf.writestr(f"report__k{k}__{tag}.txt", report_txt)
 
-    # Layout
-    box_top = W.HBox([uploader, btn_load, btn_prev])
-    box_emb = W.VBox([box_emb_hdr, txt_query, W.HBox([btn_guess_cols]), ddl_title, ddl_abs,
-                      ch_combine, W.HBox([ddl_provider, ddl_model, btn_refresh_models]),
-                      ch_compute_emb, lim_docs])
-    box_cols = W.VBox([box_smart_hdr, ddl_sem, ddl_kw, ddl_ref, ddl_mut, ch_sem_is_dist])
-    box_opts = W.VBox([ddl_norm, chk_scale, chk_avail, weight_mode, box_ranks, box_weights, topN, btn_run])
+    # 5) Tabela zbiorcza + log
+    summary_df = pd.DataFrame(out_rows).sort_values(["k", "id_kombinacji"]).reset_index(drop=True)
 
-    app = W.VBox([hdr, lbl_file, box_top, W.HTML("<hr/>"), box_emb,
-                  W.HTML("<hr/>"), W.HTML("<b>Mapowanie i wagi SMART</b>"),
-                  box_cols, box_opts, W.HTML("<hr/>"), out])
-    display(app)
+    info_md = textwrap.dedent(f"""
+    **OK. Gotowe.**  
+    • Plik ZIP: `{os.path.basename(zip_name)}`  
+    • Kombinacji: **{len(all_combos)}**, rozmiary: **{sizes_int}**  
+    • Czas: **{time.time()-t0:.1f} s**
+
+    **Uwaga metodologiczna:** zgodnie z publikacją, zestaw wskazany jednocześnie przez **4 modele** 
+    cechuje się najwyższą spójnością (najwięcej wspólnych referencji; por. tab. 6–7 i rys. 14–17), 
+    a zbyt duża liczba modeli degraduje koszyk (efekt „zbyt dużej komisji”). 
+    Dlatego domyślnie zaznaczono 2, 3 i 4 (4 jako preferowane). 
+    """)
+
+    return summary_df, zip_name, info_md
+
+
+# ───────────────────────────────────────────────────────────────────────────────
+# UI (Gradio)
+# ───────────────────────────────────────────────────────────────────────────────
+
+with gr.Blocks(title="EmbedSLR – Multi‑Embedding Wizard") as demo:
+    gr.Markdown(
+        """
+        # 📚 EmbedSLR – Multi‑Embedding Wizard
+        **Wgraj CSV ze Scopusa → wybierz modele → uruchom wszystkie kombinacje 2/3/4/5 modeli → pobierz komplet wyników (ZIP).**
+
+        Metoda: ranking per‑model (kosinus) → głosowanie **top‑K** → konsensus i sortowanie wg `hit_count ↓`, `agg_distance ↑`, `mean_rank ↑`.  
+        (Zgodnie z ECAI 2025: *Efficient AI‑Powered Decision‑Making in SLR Using Multi‑Embedding Models*).        
+        """
+    )
+
+    with gr.Row():
+        csv_in = gr.File(label="Plik CSV (export Scopus)", file_types=[".csv"], type="filepath")
+        query_in = gr.Textbox(label="Opis problemu badawczego / query", placeholder="Np. Does blockchain affect customer loyalty?", lines=3)
+
+    with gr.Row():
+        models_in = gr.CheckboxGroup(
+            choices=list(MODEL_CATALOG.keys()),
+            value=RECOMMENDED_DEFAULTS,
+            label="Wybierz modele (dowolna liczba ≥2)"
+        )
+        sizes_in = gr.CheckboxGroup(
+            choices=["2", "3", "4", "5"],
+            value=["2", "3", "4"],
+            label="Rozmiary kombinacji do uruchomienia"
+        )
+
+    with gr.Row():
+        topk_in = gr.Slider(10, 200, value=50, step=1, label="top‑K per model (głosowanie)")
+        agg_in = gr.Radio(choices=["mean", "min", "median"], value="mean", label="Agregacja dystansów (konsensus)")
+
+    with gr.Accordion("Klucze API (opcjonalnie – tylko jeśli wybierasz modele chmurowe)", open=False):
+        openai_key_in = gr.Textbox(label="OPENAI_API_KEY", type="password")
+        cohere_key_in = gr.Textbox(label="COHERE_API_KEY", type="password")
+        nomic_key_in = gr.Textbox(label="NOMIC_API_KEY", type="password")
+        gr.Markdown(
+            "> Nie podawaj kluczy, jeśli korzystasz wyłącznie z modeli lokalnych (SBERT)."
+        )
+
+    run_btn = gr.Button("▶️ Uruchom wszystkie kombinacje")
+    with gr.Row():
+        summary_out = gr.Dataframe(label="Podsumowanie kombinacji", interactive=False, wrap=True)
+    with gr.Row():
+        zip_out = gr.File(label="Pobierz ZIP z wynikami")
+    info_out = gr.Markdown()
+
+    def _run(csv_file, q, models, sizes, topk, agg, openai_key, cohere_key, nomic_key):
+        if not csv_file:
+            raise gr.Error("Wgraj plik CSV.")
+        if not q or not q.strip():
+            raise gr.Error("Uzupełnij problem badawczy (query).")
+        return run_wizard(csv_file, q.strip(), models, sizes, int(topk), agg, openai_key, cohere_key, nomic_key)
+
+    run_btn.click(
+        _run,
+        inputs=[csv_in, query_in, models_in, sizes_in, topk_in, agg_in, openai_key_in, cohere_key_in, nomic_key_in],
+        outputs=[summary_out, zip_out, info_out]
+    )
+
+if __name__ == "__main__":
+    # W Colab możesz dać share=True
+    demo.launch()
